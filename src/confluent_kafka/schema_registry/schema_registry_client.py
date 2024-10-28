@@ -18,6 +18,7 @@
 import json
 import logging
 import urllib
+import requests
 from collections import defaultdict
 from threading import Lock
 
@@ -111,7 +112,74 @@ class _RestClient(object):
                 raise ValueError("basic.auth.user.info must be in the form"
                                  " of {username}:{password}")
 
-        self.session.auth = userinfo if userinfo != ('', '') else None
+            self.session.auth = userinfo if userinfo != ('', '') else None
+
+        else: 
+            if 'bearer.auth.credentials.source' in conf_copy:
+                oauth_source = conf_copy.pop('bearer.auth.credentials.source', None)
+                if oauth_source != 'OAUTHBEARER':
+                    raise ValueError("bearer.auth.credentials.source should be OAUTHBEARER")
+
+                oauth_token_url = conf_copy.pop('bearer.auth.issuer.endpoint.url', None)
+
+                if oauth_token_url is None:
+                    raise ValueError("Missisng bearer.auth.issuer.endpoint.url")
+
+                client_id = conf_copy.pop('bearer.auth.client.id', None)
+
+                if client_id is None:
+                    raise ValueError("Missisng bearer.auth.client.id")
+
+                client_secret = conf_copy.pop('bearer.auth.client.secret', None)
+
+                if client_secret is None:
+                    raise ValueError("Missisng bearer.auth.client.secret")
+
+                scope = conf_copy.pop('bearer.auth.scope', None)
+
+                if scope is None:
+                    raise ValueError("Missisng bearer.auth.scope")
+
+                logical_cluster_id = conf_copy.pop('bearer.auth.logical.cluster', None)
+
+                if logical_cluster_id is None:
+                    raise ValueError("Missisng bearer.auth.logical.cluster")    
+
+                pool_id = conf_copy.pop('bearer.auth.identity.pool.id', None)
+
+                if pool_id is None:
+                    raise ValueError("Missisng bearer.auth.identity.pool.id")
+
+                # Step 1: Obtain an OAuth token
+                auth_response = requests.post(
+                                    oauth_token_url,
+                                    data={
+                                        'grant_type': 'client_credentials',
+                                        'client_id': client_id,
+                                        'client_secret': client_secret,
+                                        'scope': scope
+                                    }
+                                )
+
+                # Check if the request was successful
+                auth_response.raise_for_status()
+
+                # Extract the access token from the response
+                access_token = auth_response.json()['access_token']
+
+                if access_token is None:
+                    raise ValueError("Invalid Access Token {access_token}")
+
+                self.session.headers.update({
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/vnd.schemaregistry.v1+json',
+                    # Additional headers for RBAC and logical cluster ID
+                    'target-sr-cluster': logical_cluster_id,
+                    'Confluent-Identity-Pool-Id': pool_id
+                })
+
+        #Prasad - Revisit. Should we set this vlaue to None for non auth calls?
+        #self.session.auth = userinfo if userinfo != ('', '') else None
 
         # Any leftover keys are unknown to _RestClient
         if len(conf_copy) > 0:
@@ -165,13 +233,21 @@ class _RestClient(object):
             headers = {'Content-Length': str(len(body)),
                        'Content-Type': "application/vnd.schemaregistry.v1+json"}
 
+        #Prasad - Revisit for a better way to set the headers for OAuth
+        if self.session.headers is not None:
+            headers = self.session.headers
+
         response = self.session.request(
             method, url="/".join([self.base_url, url]),
             headers=headers, data=body, params=query)
 
+        # Check if the request was successful
+        response.raise_for_status()
+
         try:
             if 200 <= response.status_code <= 299:
                 return response.json()
+
             raise SchemaRegistryError(response.status_code,
                                       response.json().get('error_code'),
                                       response.json().get('message'))
